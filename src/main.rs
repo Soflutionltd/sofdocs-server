@@ -1,7 +1,13 @@
 use actix_cors::Cors;
+use actix_multipart::Multipart;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use futures_util::StreamExt;
 use serde::Serialize;
 use tracing_actix_web::TracingLogger;
+
+use sofdocs_core::document::parser::parse_docx;
+use sofdocs_core::document::renderer::render_to_html;
+use sofdocs_core::document::writer::write_docx;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -33,6 +39,55 @@ async fn upload_document() -> impl Responder {
     }))
 }
 
+async fn convert_docx_to_html(mut payload: Multipart) -> impl Responder {
+    let mut bytes = Vec::new();
+
+    while let Some(Ok(mut field)) = payload.next().await {
+        while let Some(Ok(chunk)) = field.next().await {
+            bytes.extend_from_slice(&chunk);
+        }
+    }
+
+    if bytes.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "No file uploaded"}));
+    }
+
+    match parse_docx(&bytes) {
+        Ok(doc) => {
+            let html = render_to_html(&doc);
+            HttpResponse::Ok()
+                .content_type("text/html; charset=utf-8")
+                .body(html)
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn export_docx(mut payload: Multipart) -> impl Responder {
+    let mut bytes = Vec::new();
+
+    while let Some(Ok(mut field)) = payload.next().await {
+        while let Some(Ok(chunk)) = field.next().await {
+            bytes.extend_from_slice(&chunk);
+        }
+    }
+
+    if bytes.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "No file uploaded"}));
+    }
+
+    match parse_docx(&bytes) {
+        Ok(doc) => match write_docx(&doc) {
+            Ok(docx_bytes) => HttpResponse::Ok()
+                .content_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                .append_header(("Content-Disposition", "attachment; filename=\"document.docx\""))
+                .body(docx_bytes),
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})),
+        },
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -59,7 +114,9 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::scope("/api")
                     .route("/documents", web::get().to(list_documents))
-                    .route("/documents/upload", web::post().to(upload_document)),
+                    .route("/documents/upload", web::post().to(upload_document))
+                    .route("/convert", web::post().to(convert_docx_to_html))
+                    .route("/export", web::post().to(export_docx)),
             )
     })
     .bind(&bind)?
